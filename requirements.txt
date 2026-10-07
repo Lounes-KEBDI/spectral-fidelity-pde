@@ -1,0 +1,32 @@
+# One environment for the 4 fine-tuning scripts: Poseidon-T, DPOT-Ti, GPhyT-S and MPP-Ti.
+# Python 3.9 (torch 2.0.1 has wheels for Python 3.8 to 3.11 only; DPOT's own environment is 3.9).
+# Install: pip install -r requirements.txt   (on Lab-IA: bash scripts/setup_env.sh)
+# Model code that is not a pip package is cloned separately, at pinned commits:
+#   python third_party/download_dpot_code.py    (DPOT-Ti)
+#   python third_party/download_gphyt_code.py   (GPhyT-S)
+#   python third_party/download_mpp_code.py     (MPP-Ti)
+
+# Poseidon (scOT), latest commit on main (2025-04-10), for Poseidon-T. Its pyproject.toml also installs
+# torch==2.0.1, torchvision==0.15.2, transformers==4.29.2, accelerate==0.31.0, wandb==0.14.2, ...
+scOT @ git+https://github.com/camlab-ethz/poseidon.git@b8fa28f59bd7f7673323f28d11a12c6f3a215c61
+
+# Pinned by Poseidon. DPOT uses pytorch 2.0.0 (2.0.1 is its bug-fix release), MPP pins 2.1 and GPhyT a
+# recent torch, but the DPOT, GPhyT and MPP model code only uses what torch 2.0.1 already has.
+torch==2.0.1
+# The release paired with torch 2.0.1, also pinned by Poseidon. GPhyT imports StochasticDepth from it; timm needs it.
+torchvision==0.15.2
+# Pinned by Poseidon: scOT imports internal Swinv2 classes from it (Poseidon-T).
+transformers==4.29.2
+# transformers 4.29.2 only reads model.safetensors when safetensors is installed, and does not install it (Poseidon-T).
+safetensors
+# DropPath for MPP-Ti; same version as MPP's own requirements.
+timm==0.9.5
+# Imported by the DPOT, GPhyT and MPP model code; the version DPOT and MPP pin.
+einops==0.7.0
+# torch 2.0.1 was built against NumPy 1.x.
+numpy<2
+# Used by the download scripts in models/ and by timm. transformers 4.29.2 requires <1.0.
+huggingface_hub<1.0
+# Pulled in by Poseidon (unpinned in its pyproject.toml). pandas 2.3.3 has no wheel for Python 3.9 on
+# Lab-IA (glibc 2.17), and building it from source fails with the cluster's gcc 4.8.5.
+pandas<2.3

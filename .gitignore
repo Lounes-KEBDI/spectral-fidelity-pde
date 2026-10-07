@@ -1,0 +1,13 @@
+data/*
+!data/download_data.py
+models/Poseidon-T/
+models/DPOT-Ti/
+models/GPhyT-S/
+models/MPP-Ti/
+checkpoint/
+third_party/DPOT/
+third_party/GPhyT/
+third_party/MPP/
+.venv*/
+logs/*
+!logs/.gitkeep
