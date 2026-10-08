@@ -2,7 +2,7 @@
 
 The paper ("Do Physics Foundation Models Learn Generalizable Physics?", Chu et al., arXiv:2605.29283) fixes the data protocol, but leaves many training details open. This file lists every one of those details that we had to decide ourselves. The code marks each of them with `# NOT IN PAPER`.
 
-Section 1 applies to every model. Each model then gets its own section: Poseidon-T (2), DPOT-Ti (3), GPhyT-S (4) and MPP-Ti (5).
+Section 1 applies to every model. Each model then gets its own section: Poseidon-T (2), DPOT-Ti (3), GPhyT-S (4) and MPP-Ti (5). Section 6 covers inference.
 
 **How to read the sources**
 
@@ -810,3 +810,144 @@ We use the common recipe of 1.2. MPP's numbers come from the `finetune` namespac
 ### 5.13 Smaller implementation details
 
 - **Apple GPUs.** On MPS, the script first tries MPP's masked attention and its statistics function once, and falls back to the CPU if they fail (`MPP-Ti/finetune.py:44-45, 189-202`). On CUDA nothing changes.
+
+---
+
+## 6. Inference
+
+Code: `Poseidon-T/infer.py`, `DPOT-Ti/infer.py`, `GPhyT-S/infer.py` and `MPP-Ti/infer.py`. They save predictions only and compute no metric.
+- The four files are identical except for the model name in the docstring and the model-specific section (`Poseidon-T/infer.py:71-110`, `DPOT-Ti/infer.py:71-125`, `GPhyT-S/infer.py:71-130`, `MPP-Ti/infer.py:71-130`).
+- Line numbers in 6.1-6.6 refer to `Poseidon-T/infer.py`. Every line after the model-specific section is 15 lines further down in `DPOT-Ti/infer.py`, and 20 lines further down in `GPhyT-S/infer.py` and `MPP-Ti/infer.py`.
+
+### 6.1 Autoregressive rollout
+
+- **Chosen:**
+  - The model gets ground-truth frames 0-4 and predicts frames 5-19 one at a time.
+  - Each prediction is appended to the 5-frame input window and the oldest frame is dropped. After frame 4 the model only sees its own predictions: ground truth is never used again.
+  - All 15 frames come from a single rollout. The 10 in-horizon frames and the 5 OOD rollout frames are only told apart at evaluation.
+- **Why:**
+  - The paper gives the models 5 input frames, then evaluates 10 in-horizon frames and 5 extra "OOD rollout frames" (Figure 1 caption).
+  - Its RolloutAmplification metric, E_roll / E_1-step, measures "long-horizon growth from short-horizon error" (Table 2). Errors can only grow from step to step if each step starts from the previous prediction.
+  - Every model is trained for one step only, with teacher forcing (`Poseidon-T/finetune.py:410-416`). Feeding predictions back is the only way to reach frames 6-19.
+- **Source:** `Poseidon-T/infer.py:257-275`.
+- **Paper:** says "rollout" but never "autoregressive", and does not say how the input window is updated.
+
+### 6.2 Runs and checkpoint used
+
+- **Chosen:**
+  - Every finished run: `best.pt` exists and `last.pt` does not, the same test as in training (`Poseidon-T/finetune.py:184-186`). Unfinished runs are listed in the log and skipped.
+  - The weights come from `best.pt`, the epoch with the lowest one-step val loss (1.2).
+  - Each model runs only on its own PDE's grid: 25 cells × 50 trajectories (`count=None`).
+  - The trajectories must come in file order (sample_index 0..49), so row k of a saved array is test trajectory k. The script stops otherwise.
+- **Why:** `best.pt` is the model that training selected. An unfinished run's `best.pt` can still change.
+- **Source:** `Poseidon-T/infer.py:190-213, 233-254, 329-332`.
+
+### 6.3 Normalisation
+
+- **Chosen:**
+  - The inputs are normalised with the `norm_mean` and `norm_std` saved in the run's `best.pt` (1.4).
+  - The whole rollout stays in normalised space: a step's output is the next step's input as it is.
+  - The predictions are de-normalised once, before saving, and saved in raw physical units.
+  - Both conversions use float64 arithmetic, then float32, as in training.
+- **Why:** this is exactly the mapping the model was trained with. In raw units, the evaluation needs no normalisation constants.
+- **Source:** `Poseidon-T/infer.py:216-230, 354-355`.
+
+### 6.4 fp32 inference
+
+- **Chosen:** the same precision as training (1.3):
+  - strict float32, no autocast;
+  - `torch.set_float32_matmul_precision("highest")`, and TF32 off for matmuls and cuDNN;
+  - `model.eval()` and `torch.no_grad()`;
+  - the device, chosen in the model-specific section: the same logic as training for Poseidon-T; cuda, else cpu, never MPS for DPOT-Ti, GPhyT-S and MPP-Ti (6.8-6.10). On Lab-IA all give cuda, as in training;
+  - batches of 16 trajectories, the training batch size.
+- **Why:** predictions should not depend on numerical precision (1.3).
+- **Source:** `Poseidon-T/infer.py:90, 183-187, 257, 266, 379-380`.
+
+### 6.5 Non-finite values kept as they are
+
+- **Chosen:**
+  - The outputs are never clipped, replaced or post-processed.
+  - A NaN or inf is fed back into the next step as it is, and saved as it is.
+  - The manifest counts the non-finite values of each cell (`n_nonfinite`), and the log prints the totals.
+- **Why:** a diverging rollout is a result. Replacing the values would hide it and change the errors. The evaluation decides how to count them.
+- **Source:** `Poseidon-T/infer.py:262-264, 300, 359-368`.
+
+### 6.6 Output files
+
+- **Chosen:**
+  - One `.npy` per (run, cell): `predictions/Poseidon-T/{variant}/{mix}/{pde}/{dynamic}__{ic}.npy`, float32, shape [50, 15, C, 64, 64]. Frame j is sequence frame 5 + j: j = 0-9 are in-horizon, 10-14 are OOD rollout.
+  - The ground truth is not saved; it stays in the dataset.
+  - `manifest.csv` has one row per `.npy`. Its `shift_group` column uses the paper's five groups (Section 3.3):
+    - train-seen: the 3 (dynamic, IC) pairs the train mixes are built from (`data/benchmark_api.py:49-53`);
+    - joint-OOD: both names contain "OOD";
+    - dynamic-OOD or IC-OOD: only that axis's name contains "OOD";
+    - compositional-ID: every other cell.
+
+    That gives 3 train-seen, 6 compositional-ID, 6 dynamic-OOD, 6 IC-OOD and 4 joint-OOD cells, which the script checks.
+  - Every file is first written to a temporary file, then renamed. A cell whose `.npy` already exists is skipped, so a stopped job resumes when it is submitted again.
+  - With `SMOKE_TEST`, everything goes to `predictions/Poseidon-T_smoke/` instead.
+- **Why:** our choice of format for the evaluation's inputs.
+- **Source:** `Poseidon-T/infer.py:113-140, 155-180, 278-323, 338-347`.
+
+### 6.7 Poseidon-T step
+
+- **Chosen:**
+  - The model is rebuilt from the run's own `scot_config` and weights, both read from `best.pt` (`Poseidon-T/infer.py:82-90`).
+  - Each step is training's `predict` (`Poseidon-T/finetune.py:317-320`), called from `finetune.py` itself. scOT gets the last frame of the current window and the lead time 1/19. At the first step that frame is ground-truth frame 4; after that it is the previous prediction.
+  - The lead time is 1/19 at every step. We never ask for frame 4 + k directly with lead time k/19.
+  - `frame_used` and `lead_time` are read from `best.pt` and checked against `finetune.py`.
+  - scOT still resamples 64→128→64 internally (2.3).
+- **Why:**
+  - This is exactly the one-step map the model was fine-tuned on (2.1, 2.2).
+  - scOT could take a larger lead time in a single call, but fine-tuning only ever used 1/19, and a direct jump would not be a rollout (6.1).
+- **Source:** `Poseidon-T/infer.py:93-110`.
+
+### 6.8 DPOT-Ti step
+
+- **Chosen:** each step is training's `predict` (`DPOT-Ti/finetune.py:380-399`), called from `finetune.py` itself, on all 5 frames of the current window.
+  - **Frame padding:** the window is padded to the 10 frames DPOT-Ti takes by repeating its first (oldest) frame: [w0]×6 + [w1, w2, w3, w4], as in training (3.1). At the first step w0 is ground-truth frame 0; later it is whichever frame is oldest in the window.
+  - **Channel padding:** the C real channels are padded to 4 with 1.0, built anew at every step (3.2). The window only keeps the C real channels of each prediction, so the 4 − C padded output channels are never fed back.
+  - **Resampling:** the window is Fourier-upsampled 64→128 before the model, and the prediction is Fourier-truncated 128→64 after it, with training's routine (3.3). So the window stays at 64×64 between steps.
+  - **No noise:** noise_scale 0, as in training (3.4). DPOTNet adds no noise itself (`DPOT/models/dpot.py:364-403`); DPOT's scripts add it to the inputs before calling the model (`DPOT/finetune.py:218`).
+  - **Output:** only `pred[..., 0, :C]` is kept, i.e. the single output step and the C real channels. `cls_pred` is ignored (3.6).
+  - **Checks:** the model is rebuilt from the `dpot_config` and weights in `best.pt` (`DPOT-Ti/infer.py:84-94`). The config, the DPOT commit, `frames_used`, `time_padding`, `channel_pad_value` and `resampling` saved in `best.pt` must equal those of `DPOT-Ti/finetune.py`.
+  - **Device:** cuda, else cpu, never MPS (`DPOT-Ti/infer.py:77-81`). On Apple GPUs, DPOT's complex FFT aborts the process, so the MPS test in `DPOT-Ti/finetune.py:206-216` cannot fall back to the CPU. On CUDA this is training's choice.
+- **Why:**
+  - This is exactly the one-step map the model was fine-tuned on.
+  - Fresh channel padding: in training, the padded input channels were always 1.0 and the padded output channels had no loss, so their predicted values mean nothing. Feeding them back would give the model inputs it never saw.
+  - Resampling at every step: in training, the inputs were always upsampled 64×64 frames, with no modes above the 64×64 grid's Nyquist frequency. Keeping the window at 128×128 between steps would feed back high frequencies the model never saw as input.
+- **Source:** `DPOT-Ti/infer.py:71-125`.
+- **DPOT repo:** its own test loop also rolls out autoregressively: it appends the prediction and drops the oldest frame (`DPOT/finetune.py:277-287`). But it feeds back all 4 predicted channels, padded ones included, and it does not resample between steps.
+
+### 6.9 GPhyT-S step
+
+- **Chosen:** each step is training's `predict` (`GPhyT-S/finetune.py:404-425`), called from `finetune.py` itself, on the last 4 frames of the current window (4.2).
+  - **Fields:** the C real channels go into the first C of GPhyT's 5 field slots, and the other 5 − C are filled with 0.0, built anew at every step (4.3). The window only keeps the C real channels of each prediction, so the padded output fields are never fed back.
+  - **Resampling:** the 4 frames are Fourier-resampled 64 × 64 → 256 × 128 (×4 along H, ×2 along W) before the model, and the prediction 256 × 128 → 64 × 64 after it, with training's routine (4.4). So the window stays at 64 × 64 between steps.
+  - **Integrator:** the model's forward applies the Euler integrator, as in training (4.5): the last input frame plus the network's output (`GPhyT/gphyt/model/transformer/model.py:243-248`, `GPhyT/gphyt/model/transformer/num_integration.py:39-41`).
+  - **Output:** only the first C fields of the single output frame are kept.
+  - **Checks:** the model is rebuilt from the `gphyt_config` and weights in `best.pt` (`GPhyT-S/infer.py:84-96`). The config (Euler integrator included), the GPhyT commit, `frames_used`, `gphyt_fields`, `field_slots`, `field_pad_value` and `resampling` saved in `best.pt` must equal those of `GPhyT-S/finetune.py`.
+  - **Device:** cuda, else cpu, never MPS, as for DPOT-Ti (6.8): the Fourier resampling uses the same complex FFT ops (`GPhyT-S/infer.py:77-81`). On CUDA this is training's choice.
+- **Why:**
+  - This is exactly the one-step map the model was fine-tuned on.
+  - Fresh field padding: in training, the padded input fields were always 0.0 and the padded output fields had no loss, so their predicted values mean nothing. Feeding them back would give the model inputs it never saw.
+  - Resampling at every step: in training, the inputs were always upsampled 64 × 64 frames. Keeping the window at 256 × 128 between steps would feed back high frequencies the model never saw as input.
+- **Source:** `GPhyT-S/infer.py:71-130`.
+- **GPhyT repo:** its own rollout also appends the prediction and drops the oldest frame (`GPhyT/gphyt/run/model_eval.py:402-416`, with `rollout=True`). It differs from ours between steps in four ways:
+  - it runs under bf16 autocast (`GPhyT/gphyt/run/model_eval.py:398-401`); we stay in fp32 (6.4);
+  - it feeds back all 5 predicted fields, including those a dataset does not use; those are only dropped for the loss (`GPhyT/gphyt/run/model_eval.py:412, 443-445`);
+  - it does not resample: its data is already at 256 × 128;
+  - it stops at the first NaN or inf and fills the remaining frames with NaN (`GPhyT/gphyt/run/model_eval.py:405-407, 423-434`). We keep rolling out and save the values as they are (6.5).
+
+### 6.10 MPP-Ti step
+
+- **Chosen:** each step is training's `predict` (`MPP-Ti/finetune.py:418-426`), called from `finetune.py` itself, on all 5 frames of the current window (5.2).
+  - **Resolution:** native 64 × 64, no resampling (5.4). The window is fed as it is at every step.
+  - **State labels and bcs:** the run's state labels 10 .. 10 + C − 1 (5.3) and the periodic bcs [1, 1] (5.6), at every step. `predict` builds them from `MPP-Ti/finetune.py`, and the values saved in `best.pt` must be the same.
+  - **Output:** MPP returns the next frame only, de-normalised by its own per-sample normalisation (5.5), so it comes back in our normalised space and is appended to the window as it is.
+  - **No flat-window exclusion:** leaving flat windows out (5.11) and skipping steps with non-finite gradients (5.12) are training-only measures. At inference every test trajectory is predicted. If an input makes MPP's output non-finite, for example a frame constant in every channel, the prediction is saved as it is and counted in `n_nonfinite`, as for every model (6.5).
+  - **Checks:** the model is rebuilt as in training: `build_avit` with the `mpp_config` in `best.pt`, then `expand_projections(C)`, then the weights (`MPP-Ti/infer.py:83-102`). The config, `drop_path`, the MPP commit, the width of the 3 expanded tensors (12 + C), `frames_used`, `state_labels`, `bcs` and `resampling` saved in `best.pt` must equal those of `MPP-Ti/finetune.py`.
+  - **Device:** cuda, else cpu, never MPS, as for the other models (`MPP-Ti/infer.py:77-80`). On CUDA this is training's choice.
+- **Why:** this is exactly the one-step map the model was fine-tuned on. Excluding flat test trajectories would change the test set, which the paper fixes (50 trajectories per cell).
+- **Source:** `MPP-Ti/infer.py:71-130`.
+- **MPP repo:** has no rollout code. Its validation predicts one step from ground-truth inputs only (`MPP/train_basic.py:352-357`), so there is nothing between steps to compare with.

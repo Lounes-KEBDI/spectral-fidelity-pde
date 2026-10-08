@@ -11,3 +11,4 @@ third_party/MPP/
 .venv*/
 logs/*
 !logs/.gitkeep
+predictions/
